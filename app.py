@@ -517,7 +517,7 @@ def text_to_speech():
     except Exception as e:
         print(f"❌ TTS error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-  if __name__ == '__main__':
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"🚀 Starting AI Interview Practitioner Backend")
     print(f"✅ Firebase Auth: {'Enabled' if firebase_admin._apps else 'Disabled'}")
