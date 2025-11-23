@@ -12,8 +12,10 @@ import firebase_admin
 from firebase_admin import credentials, auth
 
 app = Flask(__name__)
-CORS(app)
-
+CORS(app, origins=[
+    "https://your-netlify-site.netlify.app",  # Your Netlify URL
+    "http://localhost:8000",  # For local testing
+])
 # Initialize Firebase Admin SDK
 # OPTION 1: Using service account JSON file
 # cred = credentials.Certificate('path/to/serviceAccountKey.json')
