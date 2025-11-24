@@ -145,12 +145,12 @@ def call_llm(messages, system_prompt, max_retries=3):
                     'X-Title': 'AI Interview Practitioner'
                 },
                 json={
-                    'model': 'anthropic/claude-3.5-haiku',
+                    'model': 'google/gemma-2-9b-it',
                     'messages': [
                         {'role': 'system', 'content': system_prompt}
                     ] + messages,
                     'temperature': 0.7,
-                    'max_tokens': 2000
+                    'max_tokens': 256
                 },
                 timeout=30
             )
