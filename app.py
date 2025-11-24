@@ -12,22 +12,35 @@ import firebase_admin
 from firebase_admin import credentials, auth
 
 app = Flask(__name__)
-CORS(app, origins=[
-    "https://your-netlify-site.netlify.app",  # Your Netlify URL
-    "http://localhost:8000",  # For local testing
-])
-# Initialize Firebase Admin SDK
-# OPTION 1: Using service account JSON file
-# cred = credentials.Certificate('path/to/serviceAccountKey.json')
-# firebase_admin.initialize_app(cred)
 
-# OPTION 2: Using environment variable (recommended for production)
-cred_dict = json.loads(os.getenv('FIREBASE_CREDENTIALS', '{}'))
-if cred_dict:
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
-else:
-    print("⚠️  Firebase not initialized - set FIREBASE_CREDENTIALS env variable")
+# Updated CORS configuration for multiple frontend URLs
+CORS(app, 
+     origins=[
+         "https://eightfoldai-chat.netlify.app",  # Your actual Netlify URL
+         "https://*.netlify.app",  # Allow all Netlify subdomains
+         "http://localhost:8000",
+         "http://localhost:3000",
+         "http://127.0.0.1:8000",
+         "http://127.0.0.1:3000",
+         "http://localhost:5500",  # VS Code Live Server
+         "http://127.0.0.1:5500"
+     ],
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"]
+)
+
+# Initialize Firebase Admin SDK
+try:
+    cred_dict = json.loads(os.getenv('FIREBASE_CREDENTIALS', '{}'))
+    if cred_dict:
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK initialized")
+    else:
+        print("⚠️  Firebase not initialized - set FIREBASE_CREDENTIALS env variable")
+except Exception as e:
+    print(f"⚠️  Firebase initialization error: {str(e)}")
 
 # API Keys configuration
 ELEVEN_KEYS = [k.strip() for k in os.getenv('ELEVEN_KEYS', '').split(',') if k.strip()]
@@ -37,8 +50,9 @@ OPENAI_KEYS = [k.strip() for k in os.getenv('OPENAI_KEYS', '').split(',') if k.s
 # Key rotation indices
 key_indices = {'eleven': 0, 'openrouter': 0, 'openai': 0}
 
-# Session storage
+# Session storage with user tracking
 sessions = {}
+user_sessions = {}  # Track sessions per user
 
 def verify_firebase_token(f):
     """Decorator to verify Firebase authentication token"""
@@ -58,7 +72,7 @@ def verify_firebase_token(f):
             return f(*args, **kwargs)
         except Exception as e:
             print(f"❌ Token verification failed: {str(e)}")
-            return jsonify({"error": "Unauthorized - Invalid token"}), 401
+            return jsonify({"error": "Unauthorized - Invalid token", "details": str(e)}), 401
     
     return decorated_function
 
@@ -83,7 +97,6 @@ def get_next_key(service):
 
 def detect_inappropriate_content(text):
     """Detect inappropriate, rude, or offensive content"""
-    # Convert to lowercase for checking
     text_lower = text.lower()
     
     # Patterns to detect
@@ -96,10 +109,10 @@ def detect_inappropriate_content(text):
     is_spam = any(word in text_lower for word in spam_patterns)
     is_harassment = any(word in text_lower for word in harassment_patterns)
     
-    # Check for gibberish (too many consonants in a row, random characters)
+    # Check for gibberish
     has_gibberish = bool(re.search(r'[bcdfghjklmnpqrstvwxyz]{6,}', text_lower))
     
-    # Check for emoji-only or very short responses
+    # Check for too short responses
     is_too_short = len(text.strip()) <= 2 and not text.strip().isalpha()
     
     return {
@@ -179,15 +192,17 @@ def call_llm(messages, system_prompt, max_retries=3):
             elif response.status_code in [429, 500, 502, 503, 504]:
                 print(f"⚠️ LLM Status {response.status_code}, retrying...")
                 if attempt < max_retries - 1:
-                    time.sleep(1)
+                    time.sleep(2)
                     continue
+            else:
+                print(f"❌ LLM Error {response.status_code}: {response.text}")
             
             return {"error": f"LLM API error: {response.status_code}"}
         
         except Exception as e:
             print(f"❌ LLM Exception: {str(e)}")
             if attempt < max_retries - 1:
-                time.sleep(1)
+                time.sleep(2)
                 continue
             return {"error": f"LLM request failed: {str(e)}"}
     
@@ -299,21 +314,46 @@ SELECTION CRITERIA:
 - Consider difficulty level, number of questions answered, and overall engagement
 """
 
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint with API information"""
+    return jsonify({
+        "status": "online",
+        "service": "EightFold.ai Interview Backend",
+        "version": "2.0",
+        "endpoints": {
+            "health": "/health",
+            "start_session": "/api/start-session",
+            "chat": "/api/chat",
+            "tts": "/api/tts",
+            "user_sessions": "/api/user-sessions"
+        }
+    }), 200
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "firebase_initialized": firebase_admin._apps != {},
-        "stt": "Browser-based",
-        "eleven_keys": len(ELEVEN_KEYS),
-        "openrouter_keys": len(OPENROUTER_KEYS)
+        "firebase_initialized": len(firebase_admin._apps) > 0,
+        "stt": "Browser-based (Web Speech API)",
+        "tts": f"ElevenLabs ({len(ELEVEN_KEYS)} keys configured)",
+        "llm": f"OpenRouter ({len(OPENROUTER_KEYS)} keys configured)",
+        "active_sessions": len(sessions),
+        "cors_enabled": True
     }), 200
 
-@app.route('/api/start-session', methods=['POST'])
+@app.route('/api/start-session', methods=['POST', 'OPTIONS'])
 @verify_firebase_token
 def start_session():
     """Initialize interview session with authentication"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
     try:
         data = request.json
         domain = data.get('domain')
@@ -335,6 +375,7 @@ def start_session():
         if "error" in ai_response:
             return jsonify({"error": ai_response["error"]}), 500
         
+        # Create session
         sessions[session_id] = {
             "user_id": request.user_id,
             "user_email": request.user_email,
@@ -352,6 +393,11 @@ def start_session():
             "redirect_count": 0
         }
         
+        # Track user sessions
+        if request.user_id not in user_sessions:
+            user_sessions[request.user_id] = []
+        user_sessions[request.user_id].append(session_id)
+        
         print(f"✅ Session started: {session_id} for user {request.user_email}")
         return jsonify({
             "session_id": session_id,
@@ -364,10 +410,13 @@ def start_session():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/chat', methods=['POST'])
+@app.route('/api/chat', methods=['POST', 'OPTIONS'])
 @verify_firebase_token
 def chat():
     """Handle chat messages with edge case detection"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
     try:
         data = request.json
         session_id = data.get('session_id')
@@ -378,7 +427,7 @@ def chat():
             return jsonify({"error": "Session ID and user message are required"}), 400
         
         if session_id not in sessions:
-            return jsonify({"error": "Session not found"}), 404
+            return jsonify({"error": "Session not found or expired"}), 404
         
         session = sessions[session_id]
         
@@ -442,6 +491,12 @@ User message: {user_message}
         messages.append({"role": "assistant", "content": json.dumps(ai_response)})
         session['messages'] = messages
         
+        # Clean up session if interview ended
+        if ai_response.get('end', False):
+            print(f"✅ Session {session_id} completed")
+            # Keep session for a bit in case user wants to review
+            session['ended_at'] = time.time()
+        
         print(f"📊 Session {session_id}: {session['exchange_count']} exchanges, {session.get('inappropriate_count', 0)} flags")
         
         return jsonify(ai_response), 200
@@ -452,10 +507,13 @@ User message: {user_message}
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/tts', methods=['POST'])
+@app.route('/api/tts', methods=['POST', 'OPTIONS'])
 @verify_firebase_token
 def text_to_speech():
     """Text-to-speech with authentication"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
     try:
         data = request.json
         text = data.get('text', '')
@@ -469,9 +527,13 @@ def text_to_speech():
         text = text.replace('*', '').replace('#', '').replace('_', '').replace('`', '')
         text = ' '.join(text.split())
         
+        # Limit text length for TTS
+        if len(text) > 1000:
+            text = text[:1000]
+        
         voice_ids = {
-            'male': 'pNInz6obpgDQGcFmaJgB',
-            'female': '21m00Tcm4TlvDq8ikWAM'
+            'male': 'pNInz6obpgDQGcFmaJgB',  # Adam
+            'female': '21m00Tcm4TlvDq8ikWAM'  # Rachel
         }
         
         voice_id = voice_ids.get(voice_style, voice_ids['male'])
@@ -506,10 +568,14 @@ def text_to_speech():
                         as_attachment=False
                     )
                 elif response.status_code in [429, 500, 502, 503] and attempt < 2:
+                    print(f"⚠️  TTS attempt {attempt + 1} failed with status {response.status_code}, retrying...")
                     time.sleep(1)
                     continue
+                else:
+                    print(f"❌ TTS Error {response.status_code}: {response.text}")
             
             except Exception as e:
+                print(f"❌ TTS Exception: {str(e)}")
                 if attempt < 2:
                     time.sleep(1)
                     continue
@@ -519,13 +585,83 @@ def text_to_speech():
     except Exception as e:
         print(f"❌ TTS error: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/user-sessions', methods=['GET', 'OPTIONS'])
+@verify_firebase_token
+def get_user_sessions():
+    """Get all sessions for the authenticated user"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        user_session_ids = user_sessions.get(request.user_id, [])
+        user_session_data = []
+        
+        for session_id in user_session_ids:
+            if session_id in sessions:
+                session = sessions[session_id]
+                user_session_data.append({
+                    "session_id": session_id,
+                    "domain": session['domain'],
+                    "role": session['role'],
+                    "interview_type": session['interview_type'],
+                    "difficulty": session['difficulty'],
+                    "created_at": session['created_at'],
+                    "exchange_count": session['exchange_count'],
+                    "ended": 'ended_at' in session
+                })
+        
+        return jsonify({
+            "user_id": request.user_id,
+            "sessions": user_session_data
+        }), 200
+    
+    except Exception as e:
+        print(f"❌ Get user sessions error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# Session cleanup (run periodically to free memory)
+def cleanup_old_sessions():
+    """Remove sessions older than 24 hours"""
+    current_time = time.time()
+    to_delete = []
+    
+    for session_id, session in sessions.items():
+        # Remove if older than 24 hours
+        if current_time - session['created_at'] > 86400:
+            to_delete.append(session_id)
+        # Remove if ended and older than 1 hour
+        elif 'ended_at' in session and current_time - session['ended_at'] > 3600:
+            to_delete.append(session_id)
+    
+    for session_id in to_delete:
+        user_id = sessions[session_id]['user_id']
+        if user_id in user_sessions:
+            user_sessions[user_id] = [sid for sid in user_sessions[user_id] if sid != session_id]
+        del sessions[session_id]
+    
+    if to_delete:
+        print(f"🧹 Cleaned up {len(to_delete)} old sessions")
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 Starting AI Interview Practitioner Backend")
-    print(f"✅ Firebase Auth: {'Enabled' if firebase_admin._apps else 'Disabled'}")
+    print(f"🚀 Starting EightFold.ai Interview Backend v2.0")
+    print(f"✅ Firebase Auth: {'Enabled' if len(firebase_admin._apps) > 0 else 'Disabled'}")
     print(f"✅ STT: Browser-based (Web Speech API)")
     print(f"✅ TTS: ElevenLabs ({len(ELEVEN_KEYS)} keys)")
     print(f"✅ LLM: OpenRouter ({len(OPENROUTER_KEYS)} keys)")
+    print(f"✅ CORS: Enabled for multiple origins")
     print(f"🌐 Server: http://0.0.0.0:{port}")
-    # For production use gunicorn instead
-    app.run(host='0.0.0.0', port=port, debug=False) 
+    
+    # For production, use gunicorn instead of app.run
+    # gunicorn app:app --bind 0.0.0.0:5000 --workers 4 --timeout 120
+    app.run(host='0.0.0.0', port=port, debug=False)
