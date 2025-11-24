@@ -416,15 +416,10 @@ def tts():
 
     if not text:
         return {"error": "No text"}, 400
-
-    # Clean text for TTS
+    
     text = re.sub(r'[^\x00-\x7F]+', '', text)
-    text = text.replace('*', '').replace('#', '').replace('_', '').replace('`', '')
     text = ' '.join(text.split())
     
-    if not text.strip():
-        return {"error": "Text is empty after cleaning"}, 400
-
     api_key = get_next_eleven_key()
     if not api_key:
         return {"error": "Missing ElevenLabs key"}, 500
@@ -438,16 +433,16 @@ def tts():
 
     payload = {
         "text": text,
-        "model_id": "eleven_turbo_v2_5",
+        "model_id": "eleven_flash_v2",
         "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75
+            "stability": 0.4,
+            "similarity_boost": 0.8
         }
     }
 
     try:
         resp = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream",
             json=payload, 
             headers=headers,
             timeout=30
