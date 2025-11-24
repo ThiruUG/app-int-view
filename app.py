@@ -1,5 +1,3 @@
-# Corrected Full Claude + ElevenLabs Backend (Claude Messages API)
-
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import json
@@ -7,13 +5,15 @@ import requests
 import os
 import uuid
 import time
-import re
 from functools import wraps
 import firebase_admin
 from firebase_admin import credentials, auth
 
 app = Flask(__name__)
 
+# -------------------------------------------------------
+# CORS
+# -------------------------------------------------------
 CORS(app,
      resources={r"/*": {
          "origins": [
@@ -26,159 +26,300 @@ CORS(app,
      }},
      supports_credentials=True,
      allow_headers=["Content-Type", "Authorization"],
-     methods=["GET", "POST", "OPTIONS"])
+     methods=["GET", "POST", "OPTIONS"]
+)
 
+# -------------------------------------------------------
+# INIT FIREBASE
+# -------------------------------------------------------
 try:
-    cred_json = os.getenv('FIREBASE_CREDENTIALS', '{}')
-    cred_dict = json.loads(cred_json) if cred_json and cred_json != '{}' else None
-    if cred_dict:
+    cred_json = os.getenv("FIREBASE_CREDENTIALS", "{}")
+    if cred_json != "{}":
+        cred_dict = json.loads(cred_json)
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
-        print("Firebase init OK")
+        print("✅ Firebase Admin initialized")
+    else:
+        print("⚠️ Firebase not initialized — missing FIREBASE_CREDENTIALS")
 except Exception as e:
-    print("Firebase init error", e)
+    print("❌ Firebase init error:", str(e))
 
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')
-ANTHROPIC_VERSION = os.getenv('ANTHROPIC_VERSION', '2023-06-01')
+# -------------------------------------------------------
+# Anthropic (Claude) CONFIG
+# -------------------------------------------------------
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = "claude-sonnet-4-20250514"   # ✨ Your choice
+ANTHROPIC_VERSION = "2023-06-01"               # REQUIRED
 
-ELEVEN_KEYS = [k.strip() for k in os.getenv('ELEVEN_KEYS', '').split(',') if k.strip()]
+# -------------------------------------------------------
+# ElevenLabs CONFIG
+# -------------------------------------------------------
+ELEVEN_KEYS = [k.strip() for k in os.getenv("ELEVEN_KEYS", "").split(",") if k.strip()]
 VOICE_MAP = {
     "male": os.getenv("ELEVEN_VOICE_MALE", "pNInz6obpgDQGcFmaJgB"),
     "female": os.getenv("ELEVEN_VOICE_FEMALE", "21m00Tcm4TlvDq8ikWAM")
 }
-key_indices = {'eleven': 0}
+
+key_indices = {"eleven": 0}
+
+# Session store
 sessions = {}
 user_sessions = {}
 
 
+# -------------------------------------------------------
+# AUTH MIDDLEWARE
+# -------------------------------------------------------
 def verify_firebase_token(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if request.method == "OPTIONS":
             return f(*args, **kwargs)
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            return jsonify({"error": "Unauthorized"}), 401
-        token = header.split(" ")[1]
+
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Missing token"}), 401
+
+        token = auth_header.split("Bearer ")[1]
+
         try:
-            info = auth.verify_id_token(token)
-            request.user_id = info['uid']
+            decoded = auth.verify_id_token(token)
+            request.user_id = decoded["uid"]
+            request.user_email = decoded.get("email", "")
             return f(*args, **kwargs)
-        except:
+        except Exception as e:
+            print("❌ Invalid Firebase token:", str(e))
             return jsonify({"error": "Invalid token"}), 401
+
     return wrapper
 
 
+# -------------------------------------------------------
+# HELPER — ElevenLabs rotation
+# -------------------------------------------------------
 def get_next_eleven_key():
     if not ELEVEN_KEYS:
         return None
-    idx = key_indices['eleven']
-    key_indices['eleven'] = (idx + 1) % len(ELEVEN_KEYS)
-    return ELEVEN_KEYS[idx]
+    idx = key_indices["eleven"]
+    key = ELEVEN_KEYS[idx]
+    key_indices["eleven"] = (idx + 1) % len(ELEVEN_KEYS)
+    return key
 
 
-# Claude Messages API -------------------
-def call_claude(prompt, max_tokens=500):
+# -------------------------------------------------------
+# HELPER — Claude Messages API wrapper
+# -------------------------------------------------------
+def call_claude(system_prompt, conversation):
+    """
+    system_prompt: str
+    conversation: list of dict [{role:"user"/"assistant", content:""}]
+    """
+
     if not ANTHROPIC_API_KEY:
-        return {"error": "No Anthropic API key"}
+        return {"error": "Claude API key missing"}
 
     url = "https://api.anthropic.com/v1/messages"
+
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": ANTHROPIC_VERSION,
-        "content-type": "application/json"
+        "Content-Type": "application/json"
     }
-    payload = {
+
+    body = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "max_tokens": 600,
+        "system": system_prompt,
+        "messages": conversation
     }
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=40)
-        if r.status_code != 200:
-            return {"error": f"Claude API error {r.status_code}: {r.text}"}
-        data = r.json()
-        return {"text": data["content"][0]["text"]}
+        resp = requests.post(url, headers=headers, json=body, timeout=45)
+
+        if resp.status_code != 200:
+            print("❌ Claude Error:", resp.status_code, resp.text)
+            return {"error": resp.text}
+
+        data = resp.json()
+
+        # Claude Messages API returns:
+        #   data["content"][0]["text"]
+        text = data["content"][0]["text"]
+
+        return {"text": text}
+
     except Exception as e:
+        print("❌ Claude Exception:", str(e))
         return {"error": str(e)}
 
 
-# Prompt -------------------
+# -------------------------------------------------------
+# SYSTEM PROMPT BUILDER
+# -------------------------------------------------------
 def create_system_prompt(domain, role, interview_type, difficulty):
-    return f"You are an interview AI for domain {domain}, role {role}, type {interview_type}, difficulty {difficulty}. Ask one question at a time and return JSON responses."
+    return f"""
+You are a professional mock interview coach for:
+- Domain: {domain}
+- Role: {role}
+- Type: {interview_type}
+- Difficulty: {difficulty}
+
+Rules:
+1. Start with warm small talk.
+2. Ask one interview question at a time.
+3. Encourage the candidate.
+4. Handle short answers, off-topic replies, and inappropriate content politely.
+5. After 5–7 questions, produce a final summary with strengths, weaknesses, and score.
+
+Output ALWAYS a JSON:
+{{
+ "text_response": "",
+ "voice_response": "",
+ "end": false
+}}
+"""
 
 
-@app.route('/api/start-session', methods=['POST', 'OPTIONS'])
+# -------------------------------------------------------
+# ROUTES
+# -------------------------------------------------------
+
+@app.route("/")
+def root():
+    return {"status": "online", "claude_model": ANTHROPIC_MODEL}, 200
+
+
+@app.route("/api/start-session", methods=["POST", "OPTIONS"])
 @verify_firebase_token
 def start_session():
-    if request.method == 'OPTIONS':
-        return '', 204
-    d = request.get_json() or {}
-    if not d.get('domain'):
-        return jsonify({"error": "missing domain"}), 400
-    sid = str(uuid.uuid4())
-    system_prompt = create_system_prompt(d['domain'], d['role'], d.get('interview_type'), d.get('difficulty'))
 
-    prompt = system_prompt + "\n\nStart with warm small talk."
-    res = call_claude(prompt)
-    if 'error' in res:
-        return jsonify({'error': res['error']}), 500
+    data = request.json or {}
 
-    sessions[sid] = {
-        'user_id': request.user_id,
-        'system_prompt': system_prompt,
-        'messages': []
+    domain = data.get("domain")
+    role = data.get("role")
+    interview_type = data.get("interview_type", "Mixed")
+    difficulty = data.get("difficulty", "Intermediate")
+    duration = int(data.get("duration", 15))
+
+    if not domain or not role:
+        return {"error": "Missing domain/role"}, 400
+
+    session_id = str(uuid.uuid4())
+    system_prompt = create_system_prompt(domain, role, interview_type, difficulty)
+
+    # FIRST Claude message
+    conv = [
+        {"role": "user", "content": "Start the interview with warm small talk."}
+    ]
+
+    result = call_claude(system_prompt, conv)
+
+    if "error" in result:
+        return {"error": result["error"]}, 500
+
+    text = result["text"]
+
+    # Save session
+    sessions[session_id] = {
+        "system_prompt": system_prompt,
+        "messages": conv,
+        "created_at": time.time(),
+        "user_id": request.user_id
     }
 
-    return jsonify({
-        "session_id": sid,
+    return {
+        "session_id": session_id,
         "first_question": {
-            "text_response": res['text'],
-            "voice_response": res['text']
+            "text_response": text,
+            "voice_response": text
         }
-    }), 200
+    }, 200
 
 
-@app.route('/api/chat', methods=['POST', 'OPTIONS'])
+@app.route("/api/chat", methods=["POST", "OPTIONS"])
 @verify_firebase_token
 def chat():
-    if request.method == 'OPTIONS': return '', 204
-    d = request.get_json() or {}
-    sid = d.get('session_id')
-    umsg = d.get('user_message')
-    s = sessions.get(sid)
-    if not s: return jsonify({"error": "session missing"}), 404
 
-    convo = s['system_prompt'] + "\n\n" + "Human: " + umsg + "\nAssistant:"
-    res = call_claude(convo)
-    if 'error' in res: return jsonify({'error': res['error']}), 500
+    data = request.json or {}
+    session_id = data.get("session_id")
+    user_msg = data.get("user_message")
+    voice_style = data.get("voice_style", "male")
 
-    return jsonify({
-        "text_response": res['text'],
-        "voice_response": res['text'],
-        "end": False
-    })
+    if session_id not in sessions:
+        return {"error": "Invalid session"}, 404
+
+    session = sessions[session_id]
+
+    # Build conversation
+    conv = session["messages"]
+
+    conv.append({"role": "user", "content": user_msg})
+
+    result = call_claude(session["system_prompt"], conv)
+
+    if "error" in result:
+        return {"error": result["error"]}, 500
+
+    text = result["text"]
+
+    conv.append({"role": "assistant", "content": text})
+
+    # Detect interview end
+    end_flag = (
+        "Thank you for completing this interview" in text or
+        "[END" in user_msg
+    )
+
+    return {
+        "text_response": text,
+        "voice_response": text,
+        "end": end_flag
+    }, 200
 
 
-@app.route('/api/tts', methods=['POST'])
+@app.route("/api/tts", methods=["POST", "OPTIONS"])
 @verify_firebase_token
 def tts():
-    d = request.get_json() or {}
-    txt = d.get('text')
-    key = get_next_eleven_key()
-    if not key: return jsonify({"error": "No TTS key"}), 500
-    vid = VOICE_MAP['male']
-    r = requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{vid}",
-                      headers={"xi-api-key": key, "Content-Type": "application/json", "Accept": "audio/mpeg"},
-                      json={"text": txt}, timeout=40)
-    if r.status_code != 200:
-        return jsonify({"error": r.text}), r.status_code
-    return Response(r.content, mimetype='audio/mpeg')
+    data = request.json or {}
+    text = data.get("text")
+    voice_style = data.get("voice_style", "male")
+
+    if not text:
+        return {"error": "No text"}, 400
+
+    api_key = get_next_eleven_key()
+    if not api_key:
+        return {"error": "Missing ElevenLabs key"}, 500
+
+    voice_id = VOICE_MAP.get(voice_style, VOICE_MAP["male"])
+
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg"
+    }
+
+    payload = {
+        "text": text,
+        "model_id": "eleven_turbo_v2"
+    }
+
+    resp = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        json=payload, headers=headers
+    )
+
+    if resp.status_code != 200:
+        print("❌ TTS error:", resp.text)
+        return {"error": "TTS failed"}, 500
+
+    return Response(resp.content, mimetype="audio/mpeg")
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
+# -------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    print("🚀 Claude Sonnet 4 backend running on port", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
