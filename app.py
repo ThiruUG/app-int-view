@@ -14,17 +14,16 @@ from firebase_admin import credentials, auth
 app = Flask(__name__)
 
 # Updated CORS configuration for multiple frontend URLs
-CORS(app, 
-     origins=[
-         "https://eightfoldai-chat.netlify.app",  # Your actual Netlify URL
-         "https://*.netlify.app",  # Allow all Netlify subdomains
-         "http://localhost:8000",
-         "http://localhost:3000",
-         "http://127.0.0.1:8000",
-         "http://127.0.0.1:3000",
-         "http://localhost:5500",  # VS Code Live Server
-         "http://127.0.0.1:5500"
-     ],
+CORS(app,
+     resources={r"/*": {
+         "origins": [
+             "https://eightfoldai-chat.netlify.app",
+             "http://localhost:3000",
+             "http://127.0.0.1:3000",
+             "http://localhost:5500",
+             "http://127.0.0.1:5500"
+         ]
+     }},
      supports_credentials=True,
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "OPTIONS"]
@@ -58,23 +57,29 @@ def verify_firebase_token(f):
     """Decorator to verify Firebase authentication token"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        
-        if not auth_header or not auth_header.startswith('Bearer '):
+
+        # Allow OPTIONS requests for CORS preflight
+        if request.method == "OPTIONS":
+            return f(*args, **kwargs)
+
+        auth_header = request.headers.get("Authorization")
+
+        if not auth_header or not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized - No token provided"}), 401
-        
-        token = auth_header.split('Bearer ')[1]
-        
+
+        token = auth_header.split("Bearer ")[1]
+
         try:
-            decoded_token = auth.verify_id_token(token)
-            request.user_id = decoded_token['uid']
-            request.user_email = decoded_token.get('email', 'unknown')
+            decoded = auth.verify_id_token(token)
+            request.user_id = decoded["uid"]
+            request.user_email = decoded.get("email", "unknown")
             return f(*args, **kwargs)
         except Exception as e:
             print(f"❌ Token verification failed: {str(e)}")
-            return jsonify({"error": "Unauthorized - Invalid token", "details": str(e)}), 401
-    
+            return jsonify({"error": "Unauthorized - Invalid token"}), 401
+
     return decorated_function
+
 
 def get_next_key(service):
     """Get next API key with rotation"""
