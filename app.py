@@ -1,10 +1,9 @@
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import json
 import requests
 import os
 import uuid
-from io import BytesIO
 import time
 import re
 from functools import wraps
@@ -13,7 +12,7 @@ from firebase_admin import credentials, auth
 
 app = Flask(__name__)
 
-# Updated CORS configuration for multiple frontend URLs
+# CORS - allow your frontend origins
 CORS(app,
      resources={r"/*": {
          "origins": [
@@ -29,7 +28,7 @@ CORS(app,
      methods=["GET", "POST", "OPTIONS"]
 )
 
-# Initialize Firebase Admin SDK
+# Initialize Firebase Admin SDK if credentials provided
 try:
     cred_dict = json.loads(os.getenv('FIREBASE_CREDENTIALS', '{}'))
     if cred_dict:
@@ -41,39 +40,36 @@ try:
 except Exception as e:
     print(f"⚠️  Firebase initialization error: {str(e)}")
 
-# API Keys configuration
+# TTS and LLM configuration
 ELEVEN_KEYS = [k.strip() for k in os.getenv('ELEVEN_KEYS', '').split(',') if k.strip()]
-OPENROUTER_KEYS = [k.strip() for k in os.getenv('OPENROUTER_KEYS', '').split(',') if k.strip()]
-OPENAI_KEYS = [k.strip() for k in os.getenv('OPENAI_KEYS', '').split(',') if k.strip()]
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-3-7-sonnet')
 
 VOICE_MAP = {
-    "male": os.getenv("ELEVEN_VOICE_MALE", "pNInz6obpgDQGcFmaJgB"),      # Josh
-    "female": os.getenv("ELEVEN_VOICE_FEMALE", "21m00Tcm4TlvDq8ikWAM"),  # Rachel
+    "male": os.getenv("ELEVEN_VOICE_MALE", "pNInz6obpgDQGcFmaJgB"),
+    "female": os.getenv("ELEVEN_VOICE_FEMALE", "21m00Tcm4TlvDq8ikWAM"),
 }
 
-# Key rotation indices
-key_indices = {'eleven': 0, 'openrouter': 0, 'openai': 0}
-
-# Session storage with user tracking
+# In-memory session storage (for demo). Replace with DB for production.
 sessions = {}
-user_sessions = {}  # Track sessions per user
+user_sessions = {}
+
+# ----------------------
+# Utility / Auth helpers
+# ----------------------
 
 def verify_firebase_token(f):
-    """Decorator to verify Firebase authentication token"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-
-        # Allow OPTIONS requests for CORS preflight
+        # Allow OPTIONS preflight
         if request.method == "OPTIONS":
             return f(*args, **kwargs)
 
         auth_header = request.headers.get("Authorization")
-
         if not auth_header or not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized - No token provided"}), 401
 
         token = auth_header.split("Bearer ")[1]
-
         try:
             decoded = auth.verify_id_token(token)
             request.user_id = decoded["uid"]
@@ -85,46 +81,22 @@ def verify_firebase_token(f):
 
     return decorated_function
 
-
-def get_next_key(service):
-    """Get next API key with rotation"""
-    if service == 'eleven' and ELEVEN_KEYS:
-        idx = key_indices['eleven']
-        key = ELEVEN_KEYS[idx]
-        key_indices['eleven'] = (idx + 1) % len(ELEVEN_KEYS)
-        return key
-    elif service == 'openrouter' and OPENROUTER_KEYS:
-        idx = key_indices['openrouter']
-        key = OPENROUTER_KEYS[idx]
-        key_indices['openrouter'] = (idx + 1) % len(OPENROUTER_KEYS)
-        return key
-    elif service == 'openai' and OPENAI_KEYS:
-        idx = key_indices['openai']
-        key = OPENAI_KEYS[idx]
-        key_indices['openai'] = (idx + 1) % len(OPENAI_KEYS)
-        return key
-    return None
+# ----------------------
+# Content safety helper
+# ----------------------
 
 def detect_inappropriate_content(text):
-    """Detect inappropriate, rude, or offensive content"""
-    text_lower = text.lower()
-    
-    # Patterns to detect
+    text_lower = (text or "").lower()
     profanity_patterns = ['fuck', 'shit', 'bitch', 'ass', 'damn', 'hell', 'stupid ai', 'dumb ai', 'idiot']
     spam_patterns = ['spam', 'buy now', 'click here', 'win prize']
     harassment_patterns = ['hate you', 'kill', 'threat', 'attack']
-    
-    # Check for patterns
+
     is_profanity = any(word in text_lower for word in profanity_patterns)
     is_spam = any(word in text_lower for word in spam_patterns)
     is_harassment = any(word in text_lower for word in harassment_patterns)
-    
-    # Check for gibberish
     has_gibberish = bool(re.search(r'[bcdfghjklmnpqrstvwxyz]{6,}', text_lower))
-    
-    # Check for too short responses
-    is_too_short = len(text.strip()) <= 2 and not text.strip().isalpha()
-    
+    is_too_short = len((text or "").strip()) <= 2 and not (text or "").strip().isalpha()
+
     return {
         'is_inappropriate': is_profanity or is_harassment,
         'is_spam': is_spam,
@@ -132,348 +104,246 @@ def detect_inappropriate_content(text):
         'needs_redirection': is_profanity or is_spam or is_harassment
     }
 
+# ----------------------
+# Claude (Anthropic) LLM call
+# ----------------------
+
 def call_llm(messages, system_prompt, max_retries=3):
-    """Call LLM with retry logic and key rotation"""
+    """Call Anthropic Claude directly using REST API.
+    messages: list of dicts with keys {'role': 'user'|'assistant'|'system', 'content': '...'}
+    system_prompt: string
+    Returns parsed JSON-like dict expected by frontend.
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"error": "Missing ANTHROPIC_API_KEY env variable"}
+
+    # Build Anthropic "messages" payload: prepend system
+    anth_messages = []
+    anth_messages.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        # ensure role is one of user/assistant/system
+        role = m.get('role', 'user')
+        content = m.get('content', '')
+        anth_messages.append({"role": role, "content": content})
+
+    url = "https://api.anthropic.com/v1/chat/completions"
+    headers = {
+        'Authorization': f'Bearer {ANTHROPIC_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    payload = {
+        'model': ANTHROPIC_MODEL,
+        'messages': anth_messages,
+        'temperature': 0.7,
+        'max_tokens_to_sample': 500
+    }
+
     for attempt in range(max_retries):
-        api_key = get_next_key('openrouter')
-        if not api_key:
-            return {"error": "No OpenRouter API key available"}
-        
         try:
-            print(f"🔄 LLM attempt {attempt + 1}/{max_retries}")
-            response = requests.post(
-                'https://openrouter.ai/api/v1/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {api_key}',
-                    'Content-Type': 'application/json',
-                    'HTTP-Referer': 'https://ai-interview-practitioner.com',
-                    'X-Title': 'AI Interview Practitioner'
-                },
-                json={
-                    'model': 'google/gemma-2-9b-it',
-                    'messages': [
-                        {'role': 'system', 'content': system_prompt}
-                    ] + messages,
-                    'temperature': 0.7,
-                    'max_tokens': 256
-                },
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                content = data['choices'][0]['message']['content']
-                
-                try:
-                    if '```json' in content:
-                        content = content.split('```json')[1].split('```')[0].strip()
-                    elif '```' in content:
-                        content = content.split('```')[1].split('```')[0].strip()
-                    
-                    parsed = json.loads(content)
-                    
-                    if 'text_response' not in parsed:
-                        parsed['text_response'] = content
-                    if 'voice_response' not in parsed:
-                        parsed['voice_response'] = parsed['text_response']
-                    if 'end' not in parsed:
-                        parsed['end'] = False
-                    
-                    print(f"✅ LLM Success")
-                    return parsed
-                except json.JSONDecodeError:
-                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                    if json_match:
-                        try:
-                            return json.loads(json_match.group())
-                        except:
-                            pass
-                    
-                    if attempt < max_retries - 1:
-                        print(f"⚠️ JSON parse failed, retrying...")
-                        continue
-                    return {
-                        "text_response": content,
-                        "voice_response": content,
-                        "end": False
-                    }
-            
-            elif response.status_code in [429, 500, 502, 503, 504]:
-                print(f"⚠️ LLM Status {response.status_code}, retrying...")
-                if attempt < max_retries - 1:
+            print(f"🔄 Claude attempt {attempt+1}/{max_retries}")
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+
+            if resp.status_code != 200:
+                text = resp.text
+                print(f"❌ Claude HTTP {resp.status_code}: {text}")
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries-1:
                     time.sleep(2)
                     continue
-            else:
-                print(f"❌ LLM Error {response.status_code}: {response.text}")
-            
-            return {"error": f"LLM API error: {response.status_code}"}
-        
+                return {"error": f"Claude API error {resp.status_code}: {text}"}
+
+            data = resp.json()
+
+            # Try common locations for text output (supporting multiple Anthropic response shapes)
+            raw_text = None
+            if isinstance(data, dict):
+                # new-style: data['completion'] or data['choices'][0]['message']['content']
+                if 'completion' in data and isinstance(data['completion'], str):
+                    raw_text = data['completion']
+                elif 'choices' in data and isinstance(data['choices'], list) and len(data['choices']) > 0:
+                    ch = data['choices'][0]
+                    if 'message' in ch and 'content' in ch['message']:
+                        raw_text = ch['message']['content']
+                    elif 'text' in ch:
+                        raw_text = ch['text']
+                elif 'output' in data and isinstance(data['output'], str):
+                    raw_text = data['output']
+
+            if raw_text is None:
+                # fallback: treat whole response as text
+                raw_text = resp.text
+
+            # Attempt to extract JSON block from the assistant response
+            try:
+                # Sometimes model returns a JSON block inside markdown fences - extract if present
+                if '```json' in raw_text:
+                    raw_text = raw_text.split('```json',1)[1].split('```',1)[0].strip()
+
+                parsed = json.loads(raw_text)
+                # Ensure required keys
+                if 'text_response' not in parsed:
+                    parsed['text_response'] = raw_text
+                if 'voice_response' not in parsed:
+                    parsed['voice_response'] = parsed['text_response']
+                if 'end' not in parsed:
+                    parsed['end'] = False
+                return parsed
+            except Exception:
+                # Try to find a JSON object inside text using regex
+                json_match = re.search(r'\{[\s\S]*\}', raw_text)
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group())
+                        if 'text_response' not in parsed:
+                            parsed['text_response'] = raw_text
+                        if 'voice_response' not in parsed:
+                            parsed['voice_response'] = parsed['text_response']
+                        if 'end' not in parsed:
+                            parsed['end'] = False
+                        return parsed
+                    except Exception:
+                        pass
+
+                # Fallback: return raw_text as text_response
+                return {
+                    'text_response': raw_text,
+                    'voice_response': raw_text,
+                    'end': False
+                }
+
         except Exception as e:
-            print(f"❌ LLM Exception: {str(e)}")
-            if attempt < max_retries - 1:
+            print(f"❌ Claude request exception: {e}")
+            if attempt < max_retries-1:
                 time.sleep(2)
                 continue
-            return {"error": f"LLM request failed: {str(e)}"}
-    
-    return {"error": "Max retries exceeded"}
+            return {"error": f"Claude request failed: {str(e)}"}
+
+    return {"error": "Max retries exceeded for Claude API"}
+
+# ----------------------
+# System prompt creator
+# ----------------------
 
 def create_system_prompt(domain, role, interview_type, difficulty):
-    """Create system prompt with edge case handling"""
-    return f"""You are "AI Interview Practitioner," a professional mock interview coach with dual communication modes: text and voice.
+    return f"""You are \"AI Interview Practitioner, Claude edition\".\n
+The user has selected:\n- Domain: {domain}\n- Role: {role}\n- Interview Type: {interview_type}\n- Difficulty: {difficulty}\n
+Follow the interview flow and ALWAYS return EXACT valid JSON as specified to the frontend.\n"""
 
-The user has selected:
-- Domain: {domain}
-- Role: {role}
-- Interview Type: {interview_type}
-- Difficulty: {difficulty}
-
-OPENING BEHAVIOR (FIRST 2-3 EXCHANGES):
-1. FIRST MESSAGE: Start with warm small talk (1-2 sentences). Ask how they're feeling about the interview today.
-2. SECOND MESSAGE: After their response, acknowledge it warmly and ask one more casual question.
-3. THIRD MESSAGE: After their second response, smoothly transition: "Great! Now let's dive into the interview. Here's my first question..." and then ask your FIRST actual interview question
-
-DURING INTERVIEW (AFTER SMALL TALK):
-- Ask ONLY ONE question at a time
-- If candidate struggles, encourage: "Take your time, there's no rush"
-- If they say "I don't know", respond: "That's okay, let's move to the next question"
-- Be warm, encouraging, and professional
-- After 5-7 meaningful interview questions (not counting small talk), provide the FINAL SUMMARY
-
-EDGE CASE HANDLING (CRITICAL - ALWAYS MAINTAIN PROFESSIONALISM):
-
-1. IRRELEVANT RESPONSES:
-   - If user talks about unrelated topics (e.g., "I like pizza", "What's the weather?", random stories)
-   - Respond: "I appreciate you sharing, but let's stay focused on the interview. Let me ask you: [repeat or rephrase current question]"
-   - Never mock or be dismissive
-   - Gently redirect 2-3 times, then note in evaluation: "Candidate struggled with focus"
-
-2. RUDE/OFFENSIVE BEHAVIOR:
-   - If user is rude, uses profanity, or is disrespectful
-   - Respond with EXTREME professionalism: "I understand interviews can be stressful. Let's maintain a professional environment. May I continue with the next question?"
-   - Never escalate or respond with rudeness
-   - If behavior continues, respond: "I appreciate your time, but I think we should conclude here. Let me provide your feedback."
-   - Then END interview with summary noting: "Professional conduct needs improvement"
-
-3. GIBBERISH/NONSENSICAL INPUT:
-   - If response is random characters, emojis only, or nonsensical
-   - Respond: "I didn't quite catch that. Could you please rephrase your answer?"
-   - After 2-3 attempts, respond: "Let's move to the next question to make the best use of our time."
-
-4. ONE-WORD/VERY SHORT ANSWERS:
-   - If user consistently gives "yes", "no", "idk", "ok" type responses
-   - Respond: "Could you elaborate a bit more? I'd like to understand your thinking process."
-   - Note in evaluation: "Communication skills need development - responses lacked depth"
-
-5. ASKING AI TO DO UNETHICAL THINGS:
-   - If user asks you to give them answers, cheat, or break interview rules
-   - Respond: "I'm here to help you practice and improve, not to provide answers. Let's continue with the interview professionally."
-   - Maintain firm but polite boundaries
-
-6. OFF-TOPIC QUESTIONS TO AI:
-   - If user asks "What's your name?", "Are you real?", "Can you do X for me?"
-   - Respond: "I'm your interview coach for this session. Let's focus on helping you prepare for {role} interviews. Now, back to my question: [current question]"
-
-7. EMOTIONAL DISTRESS:
-   - If user seems very anxious, says "I can't do this", "I'm terrible", etc.
-   - Respond with empathy: "Take a deep breath. This is just practice - there's no pressure here. Would you like to take a moment, or should I ask a different question?"
-   - Be supportive while maintaining interview structure
-
-8. TECHNICAL ISSUES REPORTED:
-   - If user says "I can't hear", "mic not working", etc.
-   - Respond: "No problem! You can type your responses. Let's continue: [current question]"
-
-SPECIAL COMMANDS:
-- If user sends "[END_INTERVIEW_TIME_UP]" or "[END_INTERVIEW_MANUAL]", immediately generate the final summary
-- If user sends "[INACTIVITY_CHECK]", respond: "Are you still there? Take your time to think about the question. Would you like me to rephrase it or move to a different question?"
-- If user sends "[INAPPROPRIATE_CONTENT_DETECTED]", respond: "I understand interviews can be stressful. Let's maintain a professional environment. Would you like to continue with the next question?"
-
-EVALUATION NOTES FOR EDGE CASES:
-- Track unprofessional behavior in "weaknesses" section
-- Note focus issues, communication gaps, or conduct problems
-- Be factual and constructive, never harsh
-- If interview was disrupted significantly, mention it professionally in overall_impression
-
-You MUST respond in EXACT JSON format:
-
-{{
-  "text_response": "<chat text - can include emojis>",
-  "voice_response": "<spoken version - ABSOLUTELY NO emojis, markdown, symbols - plain English ONLY>",
-  "end": false
-}}
-
-FINAL SUMMARY FORMAT (after 5-7 questions OR when ending):
-{{
-  "text_response": "Thank you for completing this interview! Here's your comprehensive performance summary.",
-  "voice_response": "Thank you for completing this interview! Here's your comprehensive performance summary.",
-  "strengths": "<3-4 specific strengths with examples>",
-  "weaknesses": "<2-3 areas needing improvement>",
-  "score": <0-100>,
-  "communication_score": <0-100>,
-  "technical_score": <0-100>,
-  "confidence_score": <0-100>,
-  "overall_impression": "<2-3 sentences>",
-  "recommendations": "<3-4 actionable steps>",
-  "selected": <true or false - based on overall performance>,
-  "end": true
-}}
-
-SELECTION CRITERIA:
-- Selected (true): Score >= 65, answered most questions reasonably, showed effort
-- Not Selected (false): Score < 65, consistently struggled, poor communication, inappropriate behavior
-- Consider difficulty level, number of questions answered, and overall engagement
-"""
-
-# ============================================================================
-# API ENDPOINTS
-# ============================================================================
+# ----------------------
+# API endpoints
+# ----------------------
 
 @app.route('/', methods=['GET'])
 def root():
-    """Root endpoint with API information"""
     return jsonify({
-        "status": "online",
-        "service": "EightFold.ai Interview Backend",
-        "version": "2.0",
-        "endpoints": {
-            "health": "/health",
-            "start_session": "/api/start-session",
-            "chat": "/api/chat",
-            "tts": "/api/tts",
-            "user_sessions": "/api/user-sessions"
+        'status': 'online',
+        'service': 'EightFold.ai Interview Backend (Claude)',
+        'version': '3.0',
+        'endpoints': {
+            'health': '/health',
+            'start_session': '/api/start-session',
+            'chat': '/api/chat',
+            'tts': '/api/tts'
         }
-    }), 200
+    })
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
-        "status": "healthy",
-        "firebase_initialized": len(firebase_admin._apps) > 0,
-        "stt": "Browser-based (Web Speech API)",
-        "tts": f"ElevenLabs ({len(ELEVEN_KEYS)} keys configured)",
-        "llm": f"OpenRouter ({len(OPENROUTER_KEYS)} keys configured)",
-        "active_sessions": len(sessions),
-        "cors_enabled": True
-    }), 200
+        'status': 'healthy',
+        'firebase_initialized': len(firebase_admin._apps) > 0,
+        'tts': f'ElevenLabs ({len(ELEVEN_KEYS)} keys configured)',
+        'llm': f'Anthropic Claude ({ANTHROPIC_MODEL})',
+        'active_sessions': len(sessions),
+        'cors_enabled': True
+    })
 
 @app.route('/api/start-session', methods=['POST', 'OPTIONS'])
 @verify_firebase_token
 def start_session():
-    """Initialize interview session with authentication"""
     if request.method == 'OPTIONS':
         return '', 204
-    
-    try:
-        data = request.json
-        domain = data.get('domain')
-        role = data.get('role')
-        interview_type = data.get('interview_type', 'Mixed')
-        difficulty = data.get('difficulty', 'Intermediate')
-        duration = data.get('duration', 15)
-        
-        if not domain or not role:
-            return jsonify({"error": "Domain and role are required"}), 400
-        
-        session_id = str(uuid.uuid4())
-        system_prompt = create_system_prompt(domain, role, interview_type, difficulty)
-        
-        messages = [{"role": "user", "content": "Start the interview with warm small talk as instructed."}]
-        
-        ai_response = call_llm(messages, system_prompt)
-        
-        if "error" in ai_response:
-            return jsonify({"error": ai_response["error"]}), 500
-        
-        # Create session
-        sessions[session_id] = {
-            "user_id": request.user_id,
-            "user_email": request.user_email,
-            "domain": domain,
-            "role": role,
-            "interview_type": interview_type,
-            "difficulty": difficulty,
-            "duration_minutes": duration,
-            "system_prompt": system_prompt,
-            "messages": messages + [{"role": "assistant", "content": json.dumps(ai_response)}],
-            "created_at": time.time(),
-            "exchange_count": 0,
-            "question_count": 0,
-            "inappropriate_count": 0,
-            "redirect_count": 0
-        }
-        
-        # Track user sessions
-        if request.user_id not in user_sessions:
-            user_sessions[request.user_id] = []
-        user_sessions[request.user_id].append(session_id)
-        
-        print(f"✅ Session started: {session_id} for user {request.user_email}")
-        return jsonify({
-            "session_id": session_id,
-            "first_question": ai_response
-        }), 200
-    
-    except Exception as e:
-        print(f"❌ Start session error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+
+    data = request.json or {}
+    domain = data.get('domain')
+    role = data.get('role')
+    interview_type = data.get('interview_type', 'Mixed')
+    difficulty = data.get('difficulty', 'Intermediate')
+    duration = data.get('duration', 15)
+
+    if not domain or not role:
+        return jsonify({'error': 'Domain and role are required'}), 400
+
+    session_id = str(uuid.uuid4())
+    system_prompt = create_system_prompt(domain, role, interview_type, difficulty)
+
+    messages = [{'role': 'user', 'content': 'Start the interview with warm small talk as instructed.'}]
+
+    ai_response = call_llm(messages, system_prompt)
+    if 'error' in ai_response:
+        return jsonify({'error': ai_response['error']}), 500
+
+    # store session
+    sessions[session_id] = {
+        'user_id': request.user_id,
+        'user_email': request.user_email,
+        'domain': domain,
+        'role': role,
+        'interview_type': interview_type,
+        'difficulty': difficulty,
+        'duration_minutes': duration,
+        'system_prompt': system_prompt,
+        'messages': messages + [{'role': 'assistant', 'content': json.dumps(ai_response)}],
+        'created_at': time.time(),
+        'exchange_count': 0,
+        'question_count': 0,
+        'inappropriate_count': 0,
+        'redirect_count': 0
+    }
+
+    if request.user_id not in user_sessions:
+        user_sessions[request.user_id] = []
+    user_sessions[request.user_id].append(session_id)
+
+    return jsonify({'session_id': session_id, 'first_question': ai_response}), 200
 
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
 @verify_firebase_token
 def chat():
-    """Handle chat messages with edge case detection"""
     if request.method == 'OPTIONS':
         return '', 204
-    
-    try:
-        data = request.json
-        session_id = data.get('session_id')
-        user_message = data.get('user_message')
-        voice_style = data.get('voice_style', 'male')
-        
-        if not session_id or not user_message:
-            return jsonify({"error": "Session ID and user message are required"}), 400
-        
-        if session_id not in sessions:
-            return jsonify({"error": "Session not found or expired"}), 404
-        
-        session = sessions[session_id]
-        
-        # Verify session belongs to authenticated user
-        if session['user_id'] != request.user_id:
-            return jsonify({"error": "Unauthorized - Session does not belong to user"}), 403
-        
-        system_prompt = session['system_prompt']
-        messages = session['messages']
-        
-        # Detect inappropriate content (skip for special commands)
-        if not user_message.startswith('['):
-            content_check = detect_inappropriate_content(user_message)
-            
-            if content_check['needs_redirection']:
-                session['inappropriate_count'] += 1
-                session['redirect_count'] += 1
-                
-                print(f"⚠️  Inappropriate content detected in session {session_id}: {content_check}")
-                
-                # If too many inappropriate messages, end interview
-                if session['inappropriate_count'] >= 3:
-                    print(f"⚠️  Ending session {session_id} due to repeated inappropriate behavior")
-                    user_message = "[END_INTERVIEW_INAPPROPRIATE_BEHAVIOR]"
-        
-        # Add user message
-        messages.append({"role": "user", "content": user_message})
-        session['exchange_count'] += 1
-        
-        if not user_message.startswith('[') and session['exchange_count'] > 3:
-            session['question_count'] = session.get('question_count', 0) + 1
-        
-        # Calculate time context
-        elapsed_minutes = (time.time() - session['created_at']) / 60
-        time_remaining_minutes = session['duration_minutes'] - elapsed_minutes
-        
-        context_info = f"""
+
+    data = request.json or {}
+    session_id = data.get('session_id')
+    user_message = data.get('user_message')
+
+    if not session_id or user_message is None:
+        return jsonify({'error': 'Session ID and user message are required'}), 400
+
+    if session_id not in sessions:
+        return jsonify({'error': 'Session not found or expired'}), 404
+
+    session = sessions[session_id]
+    if session['user_id'] != request.user_id:
+        return jsonify({'error': 'Unauthorized - Session does not belong to user'}), 403
+
+    # safety checks
+    if not user_message.startswith('['):
+        checks = detect_inappropriate_content(user_message)
+        if checks['needs_redirection']:
+            session['inappropriate_count'] += 1
+            session['redirect_count'] += 1
+            if session['inappropriate_count'] >= 3:
+                user_message = '[END_INTERVIEW_INAPPROPRIATE_BEHAVIOR]'
+
+    session['messages'].append({'role': 'user', 'content': user_message})
+    session['exchange_count'] += 1
+
+    # Add context block to help model
+    elapsed_minutes = (time.time() - session['created_at']) / 60
+    time_remaining_minutes = session['duration_minutes'] - elapsed_minutes
+
+    context_info = f"""
 [CONTEXT - DO NOT MENTION TO USER]
 - Total exchanges: {session['exchange_count']}
 - Interview questions answered: {session.get('question_count', 0)}
@@ -486,166 +356,74 @@ def chat():
 
 User message: {user_message}
 """
-        
-        messages[-1] = {"role": "user", "content": context_info}
-        
-        # Get AI response
-        ai_response = call_llm(messages, system_prompt)
-        
-        if "error" in ai_response:
-            return jsonify({"error": ai_response["error"]}), 500
-        
-        # Update messages with actual user message
-        messages[-1] = {"role": "user", "content": user_message}
-        messages.append({"role": "assistant", "content": json.dumps(ai_response)})
-        session['messages'] = messages
-        
-        # Clean up session if interview ended
-        if ai_response.get('end', False):
-            print(f"✅ Session {session_id} completed")
-            # Keep session for a bit in case user wants to review
-            session['ended_at'] = time.time()
-        
-        print(f"📊 Session {session_id}: {session['exchange_count']} exchanges, {session.get('inappropriate_count', 0)} flags")
-        
-        return jsonify(ai_response), 200
-    
-    except Exception as e:
-        print(f"❌ Chat error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
 
-@app.route('/api/tts', methods=['POST'])
+    # Replace last added user message with context info for model
+    session['messages'][-1] = {'role': 'user', 'content': context_info}
+
+    ai_response = call_llm(session['messages'], session['system_prompt'])
+    if 'error' in ai_response:
+        return jsonify({'error': ai_response['error']}), 500
+
+    # restore actual user message in session history and append assistant response
+    session['messages'][-1] = {'role': 'user', 'content': user_message}
+    session['messages'].append({'role': 'assistant', 'content': json.dumps(ai_response)})
+
+    if ai_response.get('end', False):
+        session['ended_at'] = time.time()
+
+    return jsonify(ai_response), 200
+
+@app.route('/api/tts', methods=['POST', 'OPTIONS'])
 @verify_firebase_token
 def tts():
-    try:
-        data = request.get_json()
-        text = data.get("text")
-        voice_style = data.get("voice_style", "male").lower()
-
-        if not text:
-            return jsonify({"error": "No text provided"}), 400
-
-        api_key = get_next_key('eleven') or (ELEVEN_KEYS[0] if ELEVEN_KEYS else None)
-        if not api_key:
-            return jsonify({"error": "No ElevenLabs API key configured"}), 500
-
-        voice_id = VOICE_MAP.get(voice_style, VOICE_MAP["male"])
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-
-        headers = {
-            "xi-api-key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "audio/mpeg"
-        }
-
-        payload = {
-            "text": text,
-            "model_id": "eleven_turbo_v2",
-            "voice_settings": {"stability": 0.35, "similarity_boost": 0.7}
-        }
-
-        tts_response = requests.post(url, json=payload, headers=headers)
-
-        if tts_response.status_code != 200:
-            print("❌ ElevenLabs Error:", tts_response.text)
-            return jsonify(
-                {"error": "TTS failed", "details": tts_response.text}
-            ), tts_response.status_code
-
-        # Return MP3 bytes with correct headers
-        return Response(
-            tts_response.content,
-            mimetype="audio/mpeg",
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-                "Access-Control-Allow-Methods": "POST, OPTIONS"
-            }
-        )
-
-    except Exception as e:
-        print("❌ TTS Exception:", e)
-        return jsonify({"error": "TTS Server Error", "details": str(e)}), 500
-
-
-@app.route('/api/user-sessions', methods=['GET', 'OPTIONS'])
-@verify_firebase_token
-def get_user_sessions():
-    """Get all sessions for the authenticated user"""
     if request.method == 'OPTIONS':
         return '', 204
-    
-    try:
-        user_session_ids = user_sessions.get(request.user_id, [])
-        user_session_data = []
-        
-        for session_id in user_session_ids:
-            if session_id in sessions:
-                session = sessions[session_id]
-                user_session_data.append({
-                    "session_id": session_id,
-                    "domain": session['domain'],
-                    "role": session['role'],
-                    "interview_type": session['interview_type'],
-                    "difficulty": session['difficulty'],
-                    "created_at": session['created_at'],
-                    "exchange_count": session['exchange_count'],
-                    "ended": 'ended_at' in session
-                })
-        
-        return jsonify({
-            "user_id": request.user_id,
-            "sessions": user_session_data
-        }), 200
-    
-    except Exception as e:
-        print(f"❌ Get user sessions error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
 
-# Session cleanup (run periodically to free memory)
-def cleanup_old_sessions():
-    """Remove sessions older than 24 hours"""
-    current_time = time.time()
-    to_delete = []
-    
-    for session_id, session in sessions.items():
-        # Remove if older than 24 hours
-        if current_time - session['created_at'] > 86400:
-            to_delete.append(session_id)
-        # Remove if ended and older than 1 hour
-        elif 'ended_at' in session and current_time - session['ended_at'] > 3600:
-            to_delete.append(session_id)
-    
-    for session_id in to_delete:
-        user_id = sessions[session_id]['user_id']
-        if user_id in user_sessions:
-            user_sessions[user_id] = [sid for sid in user_sessions[user_id] if sid != session_id]
-        del sessions[session_id]
-    
-    if to_delete:
-        print(f"🧹 Cleaned up {len(to_delete)} old sessions")
+    data = request.get_json() or {}
+    text = data.get('text')
+    voice_style = (data.get('voice_style', 'male') or 'male').lower()
 
-# Error handlers
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
+    if not text:
+        return jsonify({'error': 'No text provided'}), 400
 
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({"error": "Internal server error"}), 500
+    api_key = ELEVEN_KEYS[0] if ELEVEN_KEYS else None
+    if not api_key:
+        return jsonify({'error': 'No ElevenLabs API key configured'}), 500
 
+    voice_id = VOICE_MAP.get(voice_style, VOICE_MAP['male'])
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+
+    headers = {
+        'xi-api-key': api_key,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg'
+    }
+
+    payload = {
+        'text': text,
+        'model_id': 'eleven_turbo_v2',
+        'voice_settings': {'stability': 0.35, 'similarity_boost': 0.7}
+    }
+
+    resp = requests.post(url, json=payload, headers=headers)
+    if resp.status_code != 200:
+        print('❌ ElevenLabs Error:', resp.text)
+        return jsonify({'error': 'TTS failed', 'details': resp.text}), resp.status_code
+
+    return Response(resp.content, mimetype='audio/mpeg', headers={
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS'
+    })
+
+# ----------------------
+# Run server
+# ----------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 Starting EightFold.ai Interview Backend v2.0")
+    print(f"🚀 Starting EightFold.ai Interview Backend (Claude) - Model: {ANTHROPIC_MODEL}")
     print(f"✅ Firebase Auth: {'Enabled' if len(firebase_admin._apps) > 0 else 'Disabled'}")
-    print(f"✅ STT: Browser-based (Web Speech API)")
     print(f"✅ TTS: ElevenLabs ({len(ELEVEN_KEYS)} keys)")
-    print(f"✅ LLM: OpenRouter ({len(OPENROUTER_KEYS)} keys)")
-    print(f"✅ CORS: Enabled for multiple origins")
+    print(f"✅ LLM: Anthropic Claude ({ANTHROPIC_MODEL})")
     print(f"🌐 Server: http://0.0.0.0:{port}")
-    
-    # For production, use gunicorn instead of app.run
-    # gunicorn app:app --bind 0.0.0.0:5000 --workers 4 --timeout 120
     app.run(host='0.0.0.0', port=port, debug=False)
