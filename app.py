@@ -46,6 +46,11 @@ ELEVEN_KEYS = [k.strip() for k in os.getenv('ELEVEN_KEYS', '').split(',') if k.s
 OPENROUTER_KEYS = [k.strip() for k in os.getenv('OPENROUTER_KEYS', '').split(',') if k.strip()]
 OPENAI_KEYS = [k.strip() for k in os.getenv('OPENAI_KEYS', '').split(',') if k.strip()]
 
+VOICE_MAP = {
+    "male": os.getenv("ELEVEN_VOICE_MALE", "pNInz6obpgDQGcFmaJgB"),      # Josh
+    "female": os.getenv("ELEVEN_VOICE_FEMALE", "21m00Tcm4TlvDq8ikWAM"),  # Rachel
+}
+
 # Key rotation indices
 key_indices = {'eleven': 0, 'openrouter': 0, 'openai': 0}
 
@@ -517,17 +522,17 @@ def tts():
     try:
         data = request.get_json()
         text = data.get("text")
-        voice_style = data.get("voice_style", "male")
+        voice_style = data.get("voice_style", "male").lower()
 
         if not text:
             return jsonify({"error": "No text provided"}), 400
 
-        # Pick an ElevenLabs key
-        api_key = ELEVEN_KEYS[0]
+        api_key = get_next_key('eleven') or (ELEVEN_KEYS[0] if ELEVEN_KEYS else None)
+        if not api_key:
+            return jsonify({"error": "No ElevenLabs API key configured"}), 500
 
-        # ElevenLabs TTS API
-        url = "https://api.elevenlabs.io/v1/text-to-speech/" + \
-            ("pNInz6obpgDQGcFmaJgB" if voice_style == "male" else "Xb0ZEqXn3XGQW2c3Kmbl")
+        voice_id = VOICE_MAP.get(voice_style, VOICE_MAP["male"])
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
         headers = {
             "xi-api-key": api_key,
@@ -545,7 +550,9 @@ def tts():
 
         if tts_response.status_code != 200:
             print("❌ ElevenLabs Error:", tts_response.text)
-            return jsonify({"error": "TTS failed"}), 500
+            return jsonify(
+                {"error": "TTS failed", "details": tts_response.text}
+            ), tts_response.status_code
 
         # Return MP3 bytes with correct headers
         return Response(
