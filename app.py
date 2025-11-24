@@ -537,7 +537,7 @@ def tts():
 
         payload = {
             "text": text,
-            "model_id": "eleven_monolingual_v1",
+            "model_id": "eleven_turbo_v2",
             "voice_settings": {"stability": 0.35, "similarity_boost": 0.7}
         }
 
