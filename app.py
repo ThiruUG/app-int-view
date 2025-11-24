@@ -213,11 +213,7 @@ def start_session():
     system_prompt = create_system_prompt(domain, role, interview_type, difficulty)
 
     # First prompt: instruct Claude to produce the JSON output the frontend expects
-    prompt = system_prompt + '
-
-Human: Start the interview with warm small talk as instructed.
-Assistant:'
-
+    prompt = system_prompt + "\n\nHuman: Start the interview with warm small talk as instructed.\nAssistant:"
     result = call_claude(prompt)
     if 'error' in result:
         return jsonify({'error': result['error']}), 500
@@ -290,16 +286,13 @@ def chat():
     # Build a compact conversation string
     convo = ''
     # start with system prompt
-    convo += session['system_prompt'] + '
-
-'
+    convo += session['system_prompt'] + "\n\n"
     # include last few messages (e.g., last 8)
     recent = session['messages'][-8:]
     for m in recent:
         role = 'Human' if m['role'] == 'user' else 'Assistant'
-        convo += f"{role}: {m['content']}
-"
-    convo += 'Assistant:'
+        convo += f"{role}: {m['content']}"
+    convo += "Assistant:"
 
     result = call_claude(convo)
     if 'error' in result:
