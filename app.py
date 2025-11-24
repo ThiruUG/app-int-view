@@ -14,21 +14,19 @@ app = Flask(__name__)
 # -------------------------------------------------------
 # CORS
 # -------------------------------------------------------
-CORS(app,
-     resources={r"/*": {
-         "origins": [
-             "https://eightfoldai-chat.netlify.app",
-             "http://localhost:3000",
-             "http://127.0.0.1:3000",
-             "http://localhost:5500",
-             "http://127.0.0.1:5500"
-         ]
-     }},
-     supports_credentials=True,
-     allow_headers=["Content-Type", "Authorization"],
-     methods=["GET", "POST", "OPTIONS"]
-)
 
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "https://eightfoldai-chat.netlify.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000"
+        ],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
+    }
+})
 # -------------------------------------------------------
 # INIT FIREBASE
 # -------------------------------------------------------
@@ -315,6 +313,16 @@ def tts():
 
     return Response(resp.content, mimetype="audio/mpeg")
 
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        headers = response.headers
+
+        headers['Access-Control-Allow-Origin'] = request.headers.get('Origin')
+        headers['Access-Control-Allow-Headers'] = "Content-Type, Authorization"
+        headers['Access-Control-Allow-Methods'] = "GET, POST, OPTIONS"
+        return response
 
 # -------------------------------------------------------
 # START SERVER
