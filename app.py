@@ -123,9 +123,8 @@ def detect_inappropriate_content(text):
     return {
         'is_inappropriate': is_profanity or is_harassment,
         'is_spam': is_spam,
-        'is_gibberish': has_gibberish,
         'is_too_short': is_too_short,
-        'needs_redirection': is_profanity or is_spam or is_gibberish or is_harassment
+        'needs_redirection': is_profanity or is_spam or is_harassment
     }
 
 def call_llm(messages, system_prompt, max_retries=3):
@@ -512,84 +511,57 @@ User message: {user_message}
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/tts', methods=['POST', 'OPTIONS'])
+@app.route('/api/tts', methods=['POST'])
 @verify_firebase_token
-def text_to_speech():
-    """Text-to-speech with authentication"""
-    if request.method == 'OPTIONS':
-        return '', 204
-    
+def tts():
     try:
-        data = request.json
-        text = data.get('text', '')
-        voice_style = data.get('voice_style', 'male')
-        
+        data = request.get_json()
+        text = data.get("text")
+        voice_style = data.get("voice_style", "male")
+
         if not text:
             return jsonify({"error": "No text provided"}), 400
-        
-        # Clean text for TTS
-        text = re.sub(r'[^\x00-\x7F]+', '', text)
-        text = text.replace('*', '').replace('#', '').replace('_', '').replace('`', '')
-        text = ' '.join(text.split())
-        
-        # Limit text length for TTS
-        if len(text) > 1000:
-            text = text[:1000]
-        
-        voice_ids = {
-            'male': 'pNInz6obpgDQGcFmaJgB',  # Adam
-            'female': '21m00Tcm4TlvDq8ikWAM'  # Rachel
+
+        # Pick an ElevenLabs key
+        api_key = ELEVEN_KEYS[0]
+
+        # ElevenLabs TTS API
+        url = "https://api.elevenlabs.io/v1/text-to-speech/" + \
+            ("pNInz6obpgDQGcFmaJgB" if voice_style == "male" else "Xb0ZEqXn3XGQW2c3Kmbl")
+
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg"
         }
-        
-        voice_id = voice_ids.get(voice_style, voice_ids['male'])
-        
-        for attempt in range(min(3, len(ELEVEN_KEYS)) if ELEVEN_KEYS else 1):
-            api_key = get_next_key('eleven')
-            if not api_key:
-                return jsonify({"error": "No ElevenLabs API key available"}), 500
-            
-            try:
-                response = requests.post(
-                    f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}',
-                    headers={
-                        'xi-api-key': api_key,
-                        'Content-Type': 'application/json'
-                    },
-                    json={
-                        'text': text,
-                        'model_id': 'eleven_turbo_v2_5',
-                        'voice_settings': {
-                            'stability': 0.5,
-                            'similarity_boost': 0.75
-                        }
-                    },
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    return send_file(
-                        BytesIO(response.content),
-                        mimetype='audio/mpeg',
-                        as_attachment=False
-                    )
-                elif response.status_code in [429, 500, 502, 503] and attempt < 2:
-                    print(f"⚠️  TTS attempt {attempt + 1} failed with status {response.status_code}, retrying...")
-                    time.sleep(1)
-                    continue
-                else:
-                    print(f"❌ TTS Error {response.status_code}: {response.text}")
-            
-            except Exception as e:
-                print(f"❌ TTS Exception: {str(e)}")
-                if attempt < 2:
-                    time.sleep(1)
-                    continue
-        
-        return jsonify({"error": "TTS failed after retries"}), 500
-    
+
+        payload = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {"stability": 0.35, "similarity_boost": 0.7}
+        }
+
+        tts_response = requests.post(url, json=payload, headers=headers)
+
+        if tts_response.status_code != 200:
+            print("❌ ElevenLabs Error:", tts_response.text)
+            return jsonify({"error": "TTS failed"}), 500
+
+        # Return MP3 bytes with correct headers
+        return Response(
+            tts_response.content,
+            mimetype="audio/mpeg",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Methods": "POST, OPTIONS"
+            }
+        )
+
     except Exception as e:
-        print(f"❌ TTS error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        print("❌ TTS Exception:", e)
+        return jsonify({"error": "TTS Server Error", "details": str(e)}), 500
+
 
 @app.route('/api/user-sessions', methods=['GET', 'OPTIONS'])
 @verify_firebase_token
